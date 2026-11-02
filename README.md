@@ -279,6 +279,16 @@ identical — leaving ~19 GB free for co-located workloads.
 
 Accepts **JSON body** or **query parameters**.
 
+By default, input is split into sentences, with sentences longer than 500
+characters further split at word boundaries. Chunks are synthesized
+sequentially and combined into one response. Each generated chunk is limited
+to `QWEN3_TTS_MAX_CHUNK_SECONDS` (default: 60 seconds); the total response may
+be longer.
+
+Set `QWEN3_TTS_ENABLE_CHUNKED_SPEECH=false` to restore the original behavior:
+one unchunked generation for this endpoint and uncapped, punctuation-based
+sentence chunks for `/v1/audio/speech/stream`.
+
 | Param | Default | Notes |
 |---|---|---|
 | `input` / `text` | *(required)* | Text to synthesise. `input` preferred (OpenAI SDK compat). |
@@ -292,13 +302,21 @@ Accepts **JSON body** or **query parameters**.
 ### `POST /v1/audio/speech/stream` — sentence-chunked
 
 Same parameters as above (JSON body or query params). Streams one self-contained audio file
-per sentence with length-prefixed framing:
+per sentence-sized chunk with length-prefixed framing. With chunking enabled
+(the default), sentences longer than 500 characters are split at word
+boundaries, and each generated chunk is limited to
+`QWEN3_TTS_MAX_CHUNK_SECONDS`. The total stream may be longer than that limit.
+When chunking is disabled, the route retains its original punctuation-based
+splitting and has no per-sentence duration cap.
 
 ```
 [4 bytes BE uint32: chunk_length][chunk_length bytes: audio]
 [4 bytes BE uint32: chunk_length][chunk_length bytes: audio]
 ... (stream ends on socket close)
 ```
+
+`X-TTS-Sentences` reports the number of input sentences; `X-TTS-Chunks` reports the number
+of audio frames.
 
 ### `POST /v1/audio/speech/pcm-stream` — token-level PCM (tier-1 only)
 
@@ -435,10 +453,15 @@ client = OpenAI(api_key="sk-mysecret", base_url="http://localhost:8001/v1")
 |---|---|---|
 | `QWEN3_TTS_MODEL_ID` | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Override the HF model. Only `-Base` supports the clone path. |
 | `QWEN3_TTS_MAX_TEXT_LENGTH` | `10000` | Maximum input characters (returns HTTP 413 if exceeded). |
+| `QWEN3_TTS_ENABLE_CHUNKED_SPEECH` | `true` | Enable bounded sequential chunks on standard and sentence-streaming routes; `false` restores the original generation behavior. |
+| `QWEN3_TTS_MAX_CHUNK_SECONDS` | `60` | Maximum generated duration per chunk when chunking is enabled. Codec-token limit is derived at 12 tokens per second. |
 | `QWEN3_TTS_MAX_REF_AUDIO_BYTES` | `10485760` | Maximum reference-audio upload size for `POST /v1/voices`. |
 | `QWEN3_TTS_VOICES_DIR` | `/data/voices` | Where user-registered clones persist. **Mount a volume here.** |
 | `QWEN3_TTS_PRESET_BUNDLE` | `assets/preset/bundle.safetensors` | Override preset bundle location. |
 | `QWEN3_TTS_DEFAULT_VOICE` | `ryan` | Default voice when the client omits `voice`. |
+| `QWEN3_TTS_OPENAI_VOICE_ALIASES` | `{}` | JSON map overriding OpenAI voice aliases, e.g. `{"alloy":"vivian"}`. |
+| `QWEN3_TTS_PRONUNCIATIONS` | `{}` | JSON map of whole-word spellings to spoken respellings. |
+| `QWEN3_TTS_WARMUP_TEXT` | built-in sentence | Text synthesized during CUDA warmup. |
 | `QWEN3_TTS_ASR_URL` | *(unset)* | Enable auto-transcription for `POST /v1/voices` by forwarding `audio` to an OpenAI-compatible `/v1/audio/transcriptions` endpoint (e.g. `http://qwen3-asr:8000`). Unset → silent x-vector-only fallback. |
 | `QWEN3_TTS_ASR_API_KEY` | *(unset)* | Bearer token for the ASR endpoint above. |
 | `QWEN3_TTS_ASR_MODEL` | `Qwen/Qwen3-ASR-1.7B` | `model` field sent with each transcription request. |
@@ -446,6 +469,9 @@ client = OpenAI(api_key="sk-mysecret", base_url="http://localhost:8001/v1")
 | `HF_HOME` | `/root/.cache/huggingface` | Where weights are cached. **Mount a volume here.** |
 | `HF_TOKEN` | *(unset)* | HuggingFace token for gated downloads. |
 | `QWEN_API_KEY` | *(unset)* | Require `Authorization: Bearer <key>` on `/v1/*`. |
+
+Pronunciation entries are matched case-insensitively as whole words; punctuation
+is preserved. Alias and pronunciation values are JSON objects.
 
 CLI flags:
 

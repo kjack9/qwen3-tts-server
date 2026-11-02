@@ -16,6 +16,7 @@ import io
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -94,6 +95,101 @@ def test_split_sentences_no_terminator():
     server = _import_server()
     # Single chunk with no sentence terminator should still pass through.
     assert server._split_sentences("hello world") == ["hello world"]
+
+
+def test_split_speech_chunks_bounds_long_sentences():
+    server = _import_server()
+    chunks = server._split_speech_chunks(
+        "First sentence. " + ("longword " * 120) + ". Final sentence!"
+    )
+
+    assert len(chunks) > 3
+    assert all(0 < len(chunk) <= server.MAX_SPEECH_CHUNK_CHARS for chunk in chunks)
+    assert chunks[0] == "First sentence."
+    assert chunks[-1] == "Final sentence!"
+
+
+def test_chunk_settings_default_and_validation(monkeypatch):
+    server = _import_server()
+    enable_name = "QWEN3_TTS_ENABLE_CHUNKED_SPEECH"
+    seconds_name = "QWEN3_TTS_MAX_CHUNK_SECONDS"
+    monkeypatch.delenv(enable_name, raising=False)
+    monkeypatch.delenv(seconds_name, raising=False)
+
+    assert server._bool_env(enable_name, True) is True
+    assert server._positive_int_env(seconds_name, 60) == 60
+
+    monkeypatch.setenv(enable_name, "off")
+    monkeypatch.setenv(seconds_name, "23")
+    assert server._bool_env(enable_name, True) is False
+    assert server._positive_int_env(seconds_name, 60) == 23
+
+    for invalid in ("", "maybe"):
+        monkeypatch.setenv(enable_name, invalid)
+        with pytest.raises(RuntimeError, match=enable_name):
+            server._bool_env(enable_name, True)
+    for invalid in ("0", "-2", "1.5", "invalid"):
+        monkeypatch.setenv(seconds_name, invalid)
+        with pytest.raises(RuntimeError, match=seconds_name):
+            server._positive_int_env(seconds_name, 60)
+
+
+def test_openai_voice_alias_overrides_are_case_insensitive():
+    server = _import_server()
+    assert server._parse_voice_alias_overrides('{"ALLOY":"custom_voice"}') == {
+        "alloy": "custom_voice"
+    }
+
+
+def test_qwen_pronunciation_overrides_are_whole_word(monkeypatch):
+    import re
+
+    server = _import_server()
+    monkeypatch.setattr(server, "_QWEN_PRONUNCIATIONS", {"zorbo": "ZOR-bo"})
+    monkeypatch.setattr(
+        server,
+        "_QWEN_PRONUNCIATION_PATTERN",
+        re.compile(r"(?<!\w)(?:zorbo)(?!\w)", re.IGNORECASE),
+    )
+
+    assert server._apply_qwen_pronunciations("Zorbo met Zorbology.") == "ZOR-bo met Zorbology."
+
+
+def test_preset_embedding_dimensions_match_model_families():
+    from voice_registry import _expected_voice_embedding_dim
+
+    assert _expected_voice_embedding_dim("qwen3-tts-0.6b-base") == 1024
+    assert _expected_voice_embedding_dim("Qwen3-TTS-12Hz-1.7B-Base") == 2048
+    assert _expected_voice_embedding_dim("unknown") is None
+
+
+def test_generate_audio_caps_duration_and_generator_tokens(monkeypatch):
+    import numpy as np
+
+    server = _import_server()
+    captured = {}
+    record = SimpleNamespace(ref_audio_path=None, prompt_item=object())
+
+    class _FakeModel:
+        def generate_voice_clone(self, **kwargs):
+            captured.update(kwargs)
+            return [np.zeros(61 * 24000, dtype=np.float32)], 24000
+
+    monkeypatch.setattr(server, "_voice_registry", SimpleNamespace(get=lambda _voice: record))
+    monkeypatch.setattr(server, "_model", _FakeModel(), raising=False)
+
+    wav, sample_rate = server._generate_audio_sync(
+        "A capped segment.",
+        "ryan",
+        None,
+        "English",
+        server.MAX_SPEECH_CHUNK_TOKENS,
+        server.MAX_SPEECH_CHUNK_SECONDS,
+    )
+
+    assert sample_rate == 24000
+    assert len(wav) == 60 * sample_rate
+    assert captured["max_new_tokens"] == server.MAX_SPEECH_CHUNK_TOKENS
 
 
 # -----------------------------------------------------------------------
@@ -195,6 +291,139 @@ def test_routes_registered():
     }
     missing = expected - paths
     assert not missing, f"Missing routes: {missing}"
+
+
+def test_standard_speech_synthesizes_all_bounded_chunks(monkeypatch):
+    from fastapi.testclient import TestClient
+    import numpy as np
+
+    server = _import_server()
+    calls = []
+
+    def fake_generate(
+        text, voice_id, instruct, language, max_new_tokens=None, max_audio_seconds=None
+    ):
+        calls.append((text, max_new_tokens, max_audio_seconds))
+        return np.array([len(calls)], dtype=np.float32), 24000
+
+    monkeypatch.setattr(server, "_generate_audio_sync", fake_generate)
+    monkeypatch.setattr(server, "_wav_to_bytes_sync", lambda wav, _sr, _fmt: wav.tobytes())
+    monkeypatch.setattr(server, "_model_ready", True)
+    monkeypatch.setattr(server, "_API_KEY", "")
+    monkeypatch.setattr(server, "_INFER_SEM", asyncio.Semaphore(1), raising=False)
+    monkeypatch.setattr(server, "ENABLE_CHUNKED_SPEECH", True)
+
+    response = TestClient(server.app).post(
+        "/v1/audio/speech",
+        json={
+            "input": "First sentence. " + ("longword " * 120) + ". Final sentence!",
+            "response_format": "wav",
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(calls) > 3
+    assert all(len(text) <= server.MAX_SPEECH_CHUNK_CHARS for text, _, _ in calls)
+    assert all(tokens == server.MAX_SPEECH_CHUNK_TOKENS for _, tokens, _ in calls)
+    assert all(seconds == server.MAX_SPEECH_CHUNK_SECONDS for _, _, seconds in calls)
+    assert np.frombuffer(response.content, dtype=np.float32).tolist() == list(
+        range(1, len(calls) + 1)
+    )
+
+
+def test_standard_speech_can_restore_single_shot_behavior(monkeypatch):
+    from fastapi.testclient import TestClient
+    import numpy as np
+
+    server = _import_server()
+    calls = []
+
+    def fake_generate(
+        text, voice_id, instruct, language, max_new_tokens=None, max_audio_seconds=None
+    ):
+        calls.append((text, max_new_tokens, max_audio_seconds))
+        return np.array([1], dtype=np.float32), 24000
+
+    monkeypatch.setattr(server, "_generate_audio_sync", fake_generate)
+    monkeypatch.setattr(server, "_wav_to_bytes_sync", lambda wav, _sr, _fmt: wav.tobytes())
+    monkeypatch.setattr(server, "_model_ready", True)
+    monkeypatch.setattr(server, "_API_KEY", "")
+    monkeypatch.setattr(server, "_INFER_SEM", asyncio.Semaphore(1), raising=False)
+    monkeypatch.setattr(server, "ENABLE_CHUNKED_SPEECH", False)
+    text = "First sentence. " + ("longword " * 120) + ". Final sentence!"
+
+    response = TestClient(server.app).post(
+        "/v1/audio/speech",
+        json={"input": text, "response_format": "wav"},
+    )
+
+    assert response.status_code == 200
+    assert calls == [(text, None, None)]
+
+
+def test_sentence_stream_caps_each_chunk(monkeypatch):
+    from fastapi.testclient import TestClient
+    import numpy as np
+
+    server = _import_server()
+    calls = []
+
+    def fake_generate(
+        text, voice_id, instruct, language, max_new_tokens=None, max_audio_seconds=None
+    ):
+        calls.append((text, max_new_tokens, max_audio_seconds))
+        return np.array([0], dtype=np.float32), 24000
+
+    monkeypatch.setattr(server, "_generate_audio_sync", fake_generate)
+    monkeypatch.setattr(server, "_wav_to_bytes_sync", lambda *_args: b"audio")
+    monkeypatch.setattr(server, "_model_ready", True)
+    monkeypatch.setattr(server, "_API_KEY", "")
+    monkeypatch.setattr(server, "_INFER_SEM", asyncio.Semaphore(1), raising=False)
+    monkeypatch.setattr(server, "ENABLE_CHUNKED_SPEECH", True)
+    text = "First sentence. " + ("longword " * 120) + ". Final sentence!"
+
+    response = TestClient(server.app).post(
+        "/v1/audio/speech/stream",
+        json={"input": text, "response_format": "wav"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-tts-sentences"] == str(len(server._split_sentences(text)))
+    assert response.headers["x-tts-chunks"] == str(len(calls))
+    assert all(tokens == server.MAX_SPEECH_CHUNK_TOKENS for _, tokens, _ in calls)
+    assert all(seconds == server.MAX_SPEECH_CHUNK_SECONDS for _, _, seconds in calls)
+    assert len(response.content) == len(calls) * (4 + len(b"audio"))
+
+
+def test_sentence_stream_can_restore_original_chunking(monkeypatch):
+    from fastapi.testclient import TestClient
+    import numpy as np
+
+    server = _import_server()
+    calls = []
+
+    def fake_generate(
+        text, voice_id, instruct, language, max_new_tokens=None, max_audio_seconds=None
+    ):
+        calls.append((text, max_new_tokens, max_audio_seconds))
+        return np.array([0], dtype=np.float32), 24000
+
+    monkeypatch.setattr(server, "_generate_audio_sync", fake_generate)
+    monkeypatch.setattr(server, "_wav_to_bytes_sync", lambda *_args: b"audio")
+    monkeypatch.setattr(server, "_model_ready", True)
+    monkeypatch.setattr(server, "_API_KEY", "")
+    monkeypatch.setattr(server, "_INFER_SEM", asyncio.Semaphore(1), raising=False)
+    monkeypatch.setattr(server, "ENABLE_CHUNKED_SPEECH", False)
+
+    response = TestClient(server.app).post(
+        "/v1/audio/speech/stream",
+        json={"input": "First. Second.", "response_format": "wav"},
+    )
+
+    assert response.status_code == 200
+    assert [text for text, _, _ in calls] == ["First.", "Second."]
+    assert all(tokens is None and seconds is None for _, tokens, seconds in calls)
+    assert "x-tts-chunks" not in response.headers
 
 
 # -----------------------------------------------------------------------

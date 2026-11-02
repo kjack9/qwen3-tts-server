@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import io
+import json
 import logging
 import os
 import re
@@ -69,6 +70,94 @@ from voice_registry import KIND_CUSTOM, KIND_PRESET, VoiceRegistry
 
 MODEL_ID = os.getenv("QWEN3_TTS_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
 MAX_TEXT_LENGTH = int(os.getenv("QWEN3_TTS_MAX_TEXT_LENGTH", "10000"))
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    value = os.getenv(name, str(default))
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a positive integer") from exc
+    if parsed <= 0:
+        raise RuntimeError(f"{name} must be a positive integer")
+    return parsed
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"{name} must be a boolean (true/false)")
+
+
+ENABLE_CHUNKED_SPEECH = _bool_env("QWEN3_TTS_ENABLE_CHUNKED_SPEECH", True)
+MAX_SPEECH_CHUNK_SECONDS = _positive_int_env("QWEN3_TTS_MAX_CHUNK_SECONDS", 60)
+CODEC_TOKENS_PER_SECOND = 12
+MAX_SPEECH_CHUNK_TOKENS = MAX_SPEECH_CHUNK_SECONDS * CODEC_TOKENS_PER_SECOND
+MAX_SPEECH_CHUNK_CHARS = 500
+WARMUP_TEXT = os.getenv(
+    "QWEN3_TTS_WARMUP_TEXT",
+    "The speech engine is warmed up and ready to respond.",
+)
+
+try:
+    _RAW_QWEN_PRONUNCIATIONS = json.loads(
+        os.getenv("QWEN3_TTS_PRONUNCIATIONS", "{}")
+    )
+except json.JSONDecodeError as exc:
+    raise RuntimeError(
+        "QWEN3_TTS_PRONUNCIATIONS must be a JSON object of names to respellings"
+    ) from exc
+
+if not isinstance(_RAW_QWEN_PRONUNCIATIONS, dict) or any(
+    not isinstance(word, str)
+    or not word.strip()
+    or not isinstance(respelling, str)
+    or not respelling.strip()
+    for word, respelling in _RAW_QWEN_PRONUNCIATIONS.items()
+):
+    raise RuntimeError(
+        "QWEN3_TTS_PRONUNCIATIONS must map non-empty strings to non-empty strings"
+    )
+
+_QWEN_PRONUNCIATIONS: dict[str, str] = {}
+for word, respelling in _RAW_QWEN_PRONUNCIATIONS.items():
+    normalized_word = word.casefold()
+    if normalized_word in _QWEN_PRONUNCIATIONS:
+        raise RuntimeError(
+            "QWEN3_TTS_PRONUNCIATIONS keys must be unique ignoring case"
+        )
+    _QWEN_PRONUNCIATIONS[normalized_word] = respelling
+
+_QWEN_PRONUNCIATION_PATTERN = (
+    re.compile(
+        r"(?<!\w)(?:"
+        + "|".join(
+            re.escape(word)
+            for word in sorted(_QWEN_PRONUNCIATIONS, key=len, reverse=True)
+        )
+        + r")(?!\w)",
+        flags=re.IGNORECASE,
+    )
+    if _QWEN_PRONUNCIATIONS
+    else None
+)
+
+
+def _apply_qwen_pronunciations(text: str) -> str:
+    """Apply configured whole-word pronunciation respellings."""
+    if _QWEN_PRONUNCIATION_PATTERN is None:
+        return text
+    return _QWEN_PRONUNCIATION_PATTERN.sub(
+        lambda match: _QWEN_PRONUNCIATIONS[match.group(0).casefold()],
+        text,
+    )
+
 
 # Upper bound on reference audio upload size (bytes).  10 MB comfortably
 # covers a 60 s 16-bit 48 kHz mono WAV clip plus headers.
@@ -117,6 +206,35 @@ _VOICE_MAP: dict[str, str] = {
     "nova": "serena",
     "shimmer": "vivian",
 }
+
+def _parse_voice_alias_overrides(value: str) -> dict[str, str]:
+    try:
+        overrides = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "QWEN3_TTS_OPENAI_VOICE_ALIASES must be a JSON object"
+        ) from exc
+    if not isinstance(overrides, dict) or any(
+        not isinstance(alias, str)
+        or not alias.strip()
+        or not isinstance(voice, str)
+        or not voice.strip()
+        for alias, voice in overrides.items()
+    ):
+        raise RuntimeError(
+            "QWEN3_TTS_OPENAI_VOICE_ALIASES must map non-empty strings to non-empty strings"
+        )
+    normalized = {alias.strip().casefold(): voice.strip() for alias, voice in overrides.items()}
+    if len(normalized) != len(overrides):
+        raise RuntimeError(
+            "QWEN3_TTS_OPENAI_VOICE_ALIASES keys must be unique ignoring case"
+        )
+    return normalized
+
+
+_VOICE_MAP.update(
+    _parse_voice_alias_overrides(os.getenv("QWEN3_TTS_OPENAI_VOICE_ALIASES", "{}"))
+)
 
 # Default voice when the client omits one — must match a preset or an ID
 # present in the registry at startup.
@@ -191,7 +309,38 @@ _voice_registry = VoiceRegistry(
     custom_dir=CUSTOM_VOICES_DIR,
     device=_DEVICE,
     dtype=torch.bfloat16,
+    model_id=MODEL_ID,
 )
+
+
+def _select_warmup_record():
+    """Prefer the configured voice, falling back through registered voices."""
+    record = _voice_registry.get(_DEFAULT_VOICE)
+    if record is not None:
+        return record
+
+    custom_voices = _voice_registry.list(kind=KIND_CUSTOM)
+    default_names = {_DEFAULT_VOICE.casefold()}
+    mapped_default = _VOICE_MAP.get(_DEFAULT_VOICE.casefold())
+    if mapped_default:
+        default_names.add(mapped_default.casefold())
+
+    for voice in custom_voices:
+        if voice["name"].casefold() in default_names:
+            record = _voice_registry.get(voice["id"])
+            if record is not None:
+                return record
+
+    for voice in custom_voices:
+        record = _voice_registry.get(voice["id"])
+        if record is not None:
+            return record
+
+    for voice in _voice_registry.list(kind=KIND_PRESET):
+        record = _voice_registry.get(voice["id"])
+        if record is not None:
+            return record
+    return None
 
 
 def _load_model_sync(device: str, prefer_faster: bool) -> None:
@@ -232,20 +381,16 @@ def _load_model_sync(device: str, prefer_faster: bool) -> None:
     if device == "cuda":
         logger.info("Warming up CUDA graphs …")
         warmup_start = time.time()
-        warmup_record = _voice_registry.get(_DEFAULT_VOICE)
-        if warmup_record is None:
-            presets = _voice_registry.list(kind=KIND_PRESET)
-            if presets:
-                warmup_record = _voice_registry.get(presets[0]["id"])
+        warmup_record = _select_warmup_record()
         try:
             if warmup_record is None:
                 logger.warning("No preset voices loaded — skipping warmup.")
             else:
-                warmup_kwargs = {
-                    "text": "Warmup.",
-                    "language": "English",
-                    "voice_clone_prompt": [warmup_record.prompt_item],
-                }
+                warmup_kwargs = _voice_clone_kwargs(
+                    warmup_record,
+                    text=WARMUP_TEXT,
+                    language="English",
+                )
                 model_obj.generate_voice_clone(**warmup_kwargs)
                 if _FASTER_TTS and hasattr(model_obj, "generate_voice_clone_streaming"):
                     for _ in model_obj.generate_voice_clone_streaming(**warmup_kwargs, chunk_size=4):
@@ -422,13 +567,27 @@ async def _parse_params(request: Request, **query_defaults) -> dict:
             body = {}
         return {
             "text": body.get("input") or body.get("text") or query_defaults.get("text"),
-            "voice": body.get("voice", query_defaults.get("voice", "ryan")),
+            "voice": body.get("voice", query_defaults.get("voice", _DEFAULT_VOICE)),
             "response_format": body.get("response_format", query_defaults.get("response_format", "mp3")),
             "instruct": body.get("instruct") or query_defaults.get("instruct"),
             "language": body.get("language", query_defaults.get("language", "English")),
             "speed": float(body.get("speed", query_defaults.get("speed", 1.0))),
         }
     return {**query_defaults, "speed": float(query_defaults.get("speed", 1.0))}
+
+
+def _resolve_custom_voice_name(name: str) -> str | None:
+    matches = [
+        record for record in _voice_registry.list(kind=KIND_CUSTOM)
+        if record["name"].casefold() == name.casefold()
+    ]
+    if len(matches) > 1:
+        ids = sorted(record["id"] for record in matches)
+        raise HTTPException(
+            400,
+            f"Voice name '{name}' is ambiguous. Use one of these IDs: {ids}.",
+        )
+    return matches[0]["id"] if matches else None
 
 
 def _resolve_voice(voice: str) -> str:
@@ -438,6 +597,7 @@ def _resolve_voice(voice: str) -> str:
       1. exact match on a registered voice ID (preset name or ``vc_<hex>``)
       2. OpenAI alias (alloy, echo, …) → preset name
       3. lowercased exact match (tolerate case)
+      4. unique case-insensitive match on a custom voice name
 
     Raises HTTPException(400) if no resolution is found.
     """
@@ -448,6 +608,9 @@ def _resolve_voice(voice: str) -> str:
         return mapped
     if voice.lower() in _voice_registry:
         return voice.lower()
+    custom_id = _resolve_custom_voice_name(voice)
+    if custom_id is not None:
+        return custom_id
     known = sorted([v["id"] for v in _voice_registry.list()])
     raise HTTPException(
         400,
@@ -460,7 +623,37 @@ def _resolve_voice(voice: str) -> str:
 # Core synthesis helpers
 # -----------------------------------------------------------------------
 
-def _generate_audio_sync(text: str, voice_id: str, instruct: str | None, language: str) -> tuple:
+def _voice_clone_kwargs(
+    record,
+    *,
+    text: str,
+    language: str,
+    instruct: str | None = None,
+) -> dict:
+    kwargs: dict = {
+        "text": _apply_qwen_pronunciations(text),
+        "language": language or "English",
+    }
+    if instruct:
+        kwargs["instruct"] = instruct
+
+    if record.ref_audio_path is not None:
+        kwargs["ref_audio"] = str(record.ref_audio_path)
+        kwargs["ref_text"] = record.ref_text_str or ""
+        kwargs["xvec_only"] = not bool(record.ref_text_str and record.ref_text_str.strip())
+    else:
+        kwargs["voice_clone_prompt"] = [record.prompt_item]
+    return kwargs
+
+
+def _generate_audio_sync(
+    text: str,
+    voice_id: str,
+    instruct: str | None,
+    language: str,
+    max_new_tokens: int | None = None,
+    max_audio_seconds: int | None = None,
+) -> tuple:
     """Synchronous TTS generation — call via asyncio.to_thread.
 
     ``voice_id`` must already have been resolved through :func:`_resolve_voice`.
@@ -478,22 +671,23 @@ def _generate_audio_sync(text: str, voice_id: str, instruct: str | None, languag
         # Shouldn't happen if _resolve_voice was used, but guard defensively.
         raise HTTPException(400, f"Unknown voice '{voice_id}'.")
 
-    kwargs: dict = {
-        "text": text,
-        "language": language or "English",
-    }
-    if instruct:
-        kwargs["instruct"] = instruct
+    kwargs = _voice_clone_kwargs(
+        record,
+        text=text,
+        language=language or "English",
+        instruct=instruct,
+    )
 
-    if record.ref_audio_path is not None:
-        # Tier-1 path: FasterQwen3TTS accepts ref_audio + ref_text directly.
-        kwargs["ref_audio"] = str(record.ref_audio_path)
-        kwargs["ref_text"] = record.ref_text_str or ""
-    else:
-        kwargs["voice_clone_prompt"] = [record.prompt_item]
+    if max_new_tokens is not None:
+        kwargs["max_new_tokens"] = max_new_tokens
 
     wavs, sr = _model.generate_voice_clone(**kwargs)
-    return wavs[0], sr
+    wav = wavs[0]
+    if max_audio_seconds is not None:
+        max_samples = int(sr * max_audio_seconds)
+        if wav.shape[-1] > max_samples:
+            wav = wav[..., :max_samples]
+    return wav, sr
 
 
 def _wav_to_bytes_sync(wav: np.ndarray, sr: int, fmt: str) -> bytes:
@@ -532,6 +726,21 @@ def _split_sentences(text: str) -> list[str]:
     return [s.strip() for s in _SENTENCE_RE.split(text.strip()) if s.strip()]
 
 
+def _split_speech_chunks(text: str) -> list[str]:
+    """Split sentences into bounded text chunks, preserving word boundaries."""
+    chunks = []
+    for sentence in _split_sentences(text):
+        while len(sentence) > MAX_SPEECH_CHUNK_CHARS:
+            split_at = sentence.rfind(" ", 0, MAX_SPEECH_CHUNK_CHARS + 1)
+            if split_at <= 0:
+                split_at = MAX_SPEECH_CHUNK_CHARS
+            chunks.append(sentence[:split_at].strip())
+            sentence = sentence[split_at:].strip()
+        if sentence:
+            chunks.append(sentence)
+    return chunks
+
+
 def _validate_text(text: str | None, *, required: bool = True) -> str:
     if not text or not text.strip():
         if required:
@@ -555,16 +764,17 @@ def _validate_text(text: str | None, *, required: bool = True) -> str:
 async def speech(
     request: Request,
     text: Optional[str] = Query(None, description="Text to synthesise (use 'input' for OpenAI SDK compat)"),
-    voice: str = Query("ryan", description="Speaker voice. OpenAI aliases (alloy, echo, …) are mapped automatically."),
+    voice: str = Query(_DEFAULT_VOICE, description="Speaker voice. OpenAI aliases (alloy, echo, …) are mapped automatically."),
     response_format: str = Query("mp3", description="mp3 | wav | opus"),
     instruct: Optional[str] = Query(None, description="Style/emotion hint: 'Excited and fast', 'Whisper softly', …"),
     language: str = Query("English", description="Language name, e.g. English, French, Japanese"),
     speed: float = Query(1.0, description="Speed multiplier (accepted for OpenAI compat; Qwen3-TTS does not support arbitrary speed control)"),
 ):
-    """Single-shot TTS — returns the full audio file.
+    """Synthesize sentence chunks, or one request when chunking is disabled.
 
     Accepts both OpenAI-style JSON body (``Content-Type: application/json``, ``input`` field)
-    and direct query parameters (``?text=...``).
+    and direct query parameters (``?text=...``). With chunking enabled, total
+    output can exceed the configured per-chunk duration.
     """
     if not _model_ready:
         raise HTTPException(503, "Model is still loading. Check /health and retry.")
@@ -592,11 +802,40 @@ async def speech(
         voice_in, fmt, p["language"], len(text_in), p["instruct"],
     )
 
+    chunks = (
+        _split_speech_chunks(text_in)
+        if ENABLE_CHUNKED_SPEECH
+        else [text_in]
+    )
+    if not chunks:
+        raise HTTPException(400, "No sentences found in text")
+
+    max_new_tokens = MAX_SPEECH_CHUNK_TOKENS if ENABLE_CHUNKED_SPEECH else None
+    max_audio_seconds = MAX_SPEECH_CHUNK_SECONDS if ENABLE_CHUNKED_SPEECH else None
     async with _INFER_SEM:
         t0 = time.time()
-        wav, sr = await asyncio.to_thread(
-            _generate_audio_sync, text_in, voice_in, p["instruct"], p["language"]
-        )
+        audio_chunks = []
+        sample_rate = None
+        for i, chunk in enumerate(chunks):
+            wav, sr = await asyncio.to_thread(
+                _generate_audio_sync,
+                chunk,
+                voice_in,
+                p["instruct"],
+                p["language"],
+                max_new_tokens,
+                max_audio_seconds,
+            )
+            if sample_rate is not None and sr != sample_rate:
+                raise RuntimeError(
+                    f"TTS returned inconsistent sample rates: {sample_rate} and {sr}"
+                )
+            sample_rate = sr
+            audio_chunks.append(wav)
+            logger.info("TTS chunk %d/%d synthesized (%d chars)", i + 1, len(chunks), len(chunk))
+
+        wav = np.concatenate(audio_chunks, axis=-1)
+        sr = sample_rate
         gen_ms = int((time.time() - t0) * 1000)
         output = await asyncio.to_thread(_wav_to_bytes_sync, wav, sr, fmt)
         total_ms = int((time.time() - t0) * 1000)
@@ -618,7 +857,7 @@ async def speech(
 async def speech_stream(
     request: Request,
     text: Optional[str] = Query(None),
-    voice: str = Query("ryan"),
+    voice: str = Query(_DEFAULT_VOICE),
     response_format: str = Query("opus"),
     instruct: Optional[str] = Query(None),
     language: str = Query("English"),
@@ -642,35 +881,52 @@ async def speech_stream(
     voice_in = _resolve_voice(p["voice"])
     fmt = p["response_format"].lower()
     sentences = _split_sentences(text_in)
-    if not sentences:
+    chunks = (
+        _split_speech_chunks(text_in)
+        if ENABLE_CHUNKED_SPEECH
+        else sentences
+    )
+    if not chunks:
         raise HTTPException(400, "No sentences found in text")
 
     logger.info(
-        "TTS stream: voice=%s fmt=%s sentences=%d len=%d instruct=%r",
-        voice_in, fmt, len(sentences), len(text_in), p["instruct"],
+        "TTS stream: voice=%s fmt=%s sentences=%d chunks=%d len=%d instruct=%r",
+        voice_in, fmt, len(sentences), len(chunks), len(text_in), p["instruct"],
     )
 
     async def generate_chunks() -> AsyncGenerator[bytes, None]:
         async with _INFER_SEM:
-            for i, sentence in enumerate(sentences):
+            for i, chunk_text in enumerate(chunks):
                 if await request.is_disconnected():
-                    logger.info("TTS stream: client disconnected at chunk %d/%d", i, len(sentences))
+                    logger.info("TTS stream: client disconnected at chunk %d/%d", i, len(chunks))
                     return
                 t0 = time.time()
                 wav, sr = await asyncio.to_thread(
-                    _generate_audio_sync, sentence, voice_in, p["instruct"], p["language"]
+                    _generate_audio_sync,
+                    chunk_text,
+                    voice_in,
+                    p["instruct"],
+                    p["language"],
+                    MAX_SPEECH_CHUNK_TOKENS if ENABLE_CHUNKED_SPEECH else None,
+                    MAX_SPEECH_CHUNK_SECONDS if ENABLE_CHUNKED_SPEECH else None,
                 )
                 chunk = await asyncio.to_thread(_wav_to_bytes_sync, wav, sr, fmt)
                 logger.info(
                     'TTS stream chunk %d/%d: %.2fs %d bytes "%s"',
-                    i + 1, len(sentences), time.time() - t0, len(chunk), sentence[:60],
+                    i + 1, len(chunks), time.time() - t0, len(chunk), chunk_text[:60],
                 )
                 yield struct.pack(">I", len(chunk)) + chunk
 
+    headers = {
+        "X-TTS-Sentences": str(len(sentences)),
+        "X-TTS-Stream": "chunked",
+    }
+    if ENABLE_CHUNKED_SPEECH:
+        headers["X-TTS-Chunks"] = str(len(chunks))
     return StreamingResponse(
         generate_chunks(),
         media_type="application/octet-stream",
-        headers={"X-TTS-Sentences": str(len(sentences)), "X-TTS-Stream": "chunked"},
+        headers=headers,
     )
 
 
@@ -682,7 +938,7 @@ async def speech_stream(
 async def speech_pcm_stream(
     request: Request,
     text: Optional[str] = Query(None),
-    voice: str = Query("ryan"),
+    voice: str = Query(_DEFAULT_VOICE),
     instruct: Optional[str] = Query(None),
     chunk_size: int = Query(4, description="Codec frames per yield. Lower = lower latency, more overhead."),
     language: str = Query("English"),
@@ -727,19 +983,13 @@ async def speech_pcm_stream(
             def _stream_in_thread() -> None:
                 """Run the synchronous CUDA-graph generator in a thread, post chunks to queue."""
                 try:
-                    kwargs: dict = {
-                        "text": text_in,
-                        "language": p["language"] or "English",
-                        "chunk_size": chunk_size,
-                    }
-                    if p.get("instruct"):
-                        kwargs["instruct"] = p["instruct"]
-                    # Tier-1 custom clones: use ref_audio path instead of prompt_item.
-                    if record.ref_audio_path is not None:
-                        kwargs["ref_audio"] = str(record.ref_audio_path)
-                        kwargs["ref_text"] = record.ref_text_str or ""
-                    else:
-                        kwargs["voice_clone_prompt"] = [record.prompt_item]
+                    kwargs = _voice_clone_kwargs(
+                        record,
+                        text=text_in,
+                        language=p["language"],
+                        instruct=p.get("instruct"),
+                    )
+                    kwargs["chunk_size"] = chunk_size
                     for item in _model.generate_voice_clone_streaming(**kwargs):
                         loop.call_soon_threadsafe(queue.put_nowait, item)
                 except Exception as exc:  # noqa: BLE001

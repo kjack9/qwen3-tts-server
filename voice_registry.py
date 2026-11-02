@@ -51,6 +51,23 @@ logger = logging.getLogger(__name__)
 KIND_PRESET = "preset"
 KIND_CUSTOM = "custom"
 
+# Speaker-vector widths differ between Qwen3-TTS model families. Only load a
+# preset bundle when its vectors match the configured model.
+_MODEL_VOICE_EMBEDDING_DIMS = {
+    "0.6b": 1024,
+    "1.7b": 2048,
+}
+
+
+def _expected_voice_embedding_dim(model_id: str | None) -> int | None:
+    if not model_id:
+        return None
+    normalized = model_id.casefold()
+    for model_size, dimension in _MODEL_VOICE_EMBEDDING_DIMS.items():
+        if model_size in normalized:
+            return dimension
+    return None
+
 
 @dataclass
 class VoiceRecord:
@@ -117,12 +134,14 @@ class VoiceRegistry:
         custom_dir: Path,
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
+        model_id: str | None = None,
     ) -> None:
         self.preset_bundle_path = preset_bundle_path
         self.preset_meta_path = preset_meta_path
         self.custom_dir = custom_dir
         self.device = device
         self.dtype = dtype
+        self.model_id = model_id
         self._voices: dict[str, VoiceRecord] = {}
         self._lock = threading.RLock()
         self._model = None  # bound later
@@ -172,8 +191,19 @@ class VoiceRegistry:
                 logger.warning("preset bundle.json unreadable: %s", exc)
 
         speakers_meta = (meta.get("speakers") or {}) if meta else {}
+        expected_dim = _expected_voice_embedding_dim(self.model_id)
         count = 0
         for name, row in rows.items():
+            actual_dim = row.shape[-1] if row.ndim else 0
+            if expected_dim is not None and actual_dim != expected_dim:
+                logger.warning(
+                    "Skipping preset voice %s: bundle vector is %d-d but model %s expects %d-d.",
+                    name,
+                    actual_dim,
+                    self.model_id,
+                    expected_dim,
+                )
+                continue
             # Bundle was saved on CPU; move to target device/dtype lazily.
             embedding = row.to(device=self.device, dtype=self.dtype).contiguous()
             prompt_item = _build_prompt_item(
@@ -499,11 +529,17 @@ class VoiceRegistry:
 
         # Remove files on disk best-effort — lock is already released so we
         # don't hold it during I/O.
-        for suffix in (".safetensors", ".json"):
+        paths = [
+            self.custom_dir / f"{voice_id}.safetensors",
+            self.custom_dir / f"{voice_id}.json",
+        ]
+        if record.ref_audio_path is not None:
+            paths.append(record.ref_audio_path)
+        for path in paths:
             try:
-                (self.custom_dir / f"{voice_id}{suffix}").unlink(missing_ok=True)
+                path.unlink(missing_ok=True)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to remove %s%s: %s", voice_id, suffix, exc)
+                logger.warning("Failed to remove %s: %s", path, exc)
         logger.info("Deleted custom voice %s", voice_id)
         return True
 
