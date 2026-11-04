@@ -279,12 +279,31 @@ identical — leaving ~19 GB free for co-located workloads.
 
 Accepts **JSON body** or **query parameters**.
 
-By default, adjacent sentences are packed together up to
-`QWEN3_TTS_MAX_CHUNK_CHARS` (default: 500 characters). Sentences longer than
-the limit are split at word boundaries. Chunks are synthesized sequentially
-and combined into one response. Each generated chunk is limited to
-`QWEN3_TTS_MAX_CHUNK_SECONDS` (default: 60 seconds); the total response may be
-longer.
+The default duration policy estimates spoken duration at 3.13 words per second:
+text of up to 30 seconds stays in one pass; longer text splits at the first
+sentence end at or after 30 seconds. If there is no sentence end before the
+60-second estimate, the split follows the current whole word. The same policy
+repeats for the remainder. Each request is planned independently; queue time and
+other active requests do not change its boundaries. These are estimates of
+spoken duration, not exact audio timestamps or generation-time guarantees.
+Duration mode preserves all source words and does not truncate the waveform.
+
+Two inference slots are enabled by default. They share model Parameters but
+own separate talker modules, CUDA graphs, KV caches, and input/output buffers.
+GPU work can interleave without sharing another request's mutable generation
+state. Multi-slot operation requires `faster-qwen3-tts`; set
+`QWEN3_TTS_INFERENCE_SLOTS=1` for the reference or CPU backend.
+
+WAV/MP3/Opus responses are buffered until all text chunks are generated and
+combined. Request `response_format="pcm"` for a continuous raw PCM response:
+24 kHz mono signed 16-bit little-endian audio, without WAV headers or custom
+length framing. PCM chunks are delivered after each text segment is generated,
+allowing playback before the entire request finishes. Clients must consume the
+HTTP response incrementally to receive that benefit.
+
+Set `QWEN3_TTS_CHUNK_STRATEGY=characters` to retain the legacy character-bound
+chunker. In that strategy, `QWEN3_TTS_MAX_CHUNK_CHARS` splits long sentences at
+word boundaries, and `QWEN3_TTS_MAX_CHUNK_SECONDS` caps/truncates generated audio.
 
 Set `QWEN3_TTS_ENABLE_CHUNKED_SPEECH=false` to restore the original behavior:
 one unchunked generation for this endpoint and uncapped, punctuation-based
@@ -297,16 +316,14 @@ sentence chunks for `/v1/audio/speech/stream`.
 | `voice` | `ryan` | Preset name (`ryan`, `vivian`, …), OpenAI alias (`alloy`, `nova`, …), or a registered clone ID (`vc_ab12cd34`). See `GET /v1/voices`. |
 | `language` | `English` | `English`, `French`, `Chinese`, `German`, `Spanish`, … |
 | `instruct` | *(none)* | Style hint, e.g. `"Excited and speak quickly."` |
-| `response_format` | `mp3` | `mp3`, `wav`, or `opus` |
+| `response_format` | `mp3` | `mp3`, `wav`, `opus`, or incrementally delivered raw `pcm` |
 | `speed` | `1.0` | Accepted for OpenAI compat; Qwen3-TTS does not support speed control. |
 
 ### `POST /v1/audio/speech/stream` — sentence-chunked
 
-Same parameters as above (JSON body or query params). Streams one self-contained audio file
-per bounded chunk with length-prefixed framing. With chunking enabled (the default),
-adjacent sentences are packed together up to `QWEN3_TTS_MAX_CHUNK_CHARS`; oversized
-sentences are split at word boundaries. Each generated chunk is limited to
-`QWEN3_TTS_MAX_CHUNK_SECONDS`. The total stream may be longer than that limit.
+Same parameters as above (JSON body or query params). Streams one self-contained
+audio segment per planned text chunk with length-prefixed framing. It uses the
+same configurable duration or character strategy as the standard endpoint.
 When chunking is disabled, the route retains its original punctuation-based
 splitting and has no per-sentence duration cap.
 
@@ -454,9 +471,14 @@ client = OpenAI(api_key="sk-mysecret", base_url="http://localhost:8001/v1")
 |---|---|---|
 | `QWEN3_TTS_MODEL_ID` | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Override the HF model. Only `-Base` supports the clone path. |
 | `QWEN3_TTS_MAX_TEXT_LENGTH` | `10000` | Maximum input characters (returns HTTP 413 if exceeded). |
-| `QWEN3_TTS_ENABLE_CHUNKED_SPEECH` | `true` | Enable bounded sequential chunks on standard and sentence-streaming routes; `false` restores the original generation behavior. |
-| `QWEN3_TTS_MAX_CHUNK_SECONDS` | `60` | Maximum generated duration per chunk when chunking is enabled. Codec-token limit is derived at 12 tokens per second. |
-| `QWEN3_TTS_MAX_CHUNK_CHARS` | `500` | Maximum input characters per generated chunk; long sentences split at a word boundary. |
+| `QWEN3_TTS_ENABLE_CHUNKED_SPEECH` | `true` | Enable text chunking on standard and sentence-streaming routes; `false` uses one pass for standard requests. |
+| `QWEN3_TTS_INFERENCE_SLOTS` | `2` | Concurrent requests with shared model weights and private graph/cache state. Use `1` for the reference/CPU backend. |
+| `QWEN3_TTS_SERIALIZE_CODEC_DECODE` | `true` | Reuse one large codec-decode workspace across slots while autoregressive speech generation remains interleaved. |
+| `QWEN3_TTS_CHUNK_STRATEGY` | `duration` | `duration` for spoken-duration estimates; `characters` for legacy character limits and waveform caps. |
+| `QWEN3_TTS_TARGET_CHUNK_SECONDS` | `30` | In duration mode, seek the next sentence end after this solo spoken-duration estimate. Must not exceed the maximum. |
+| `QWEN3_TTS_MAX_CHUNK_SECONDS` | `60` | In duration mode, force a whole-word split at this estimate. In character mode, cap codec tokens and truncate audio at this duration. |
+| `QWEN3_TTS_ESTIMATED_WORDS_PER_SECOND` | `3.13` | Positive speaking-rate estimate calibrated for the app1 English voice; independent of request concurrency. |
+| `QWEN3_TTS_MAX_CHUNK_CHARS` | `500` | Legacy character strategy only: maximum input characters per chunk. |
 | `QWEN3_TTS_CUDA_MEMORY_FRACTION` | *(unset)* | Optional PyTorch CUDA caching-allocator limit as a fraction of total visible device memory (0–1]; allocations over the limit raise CUDA OOM rather than falling back to RAM. |
 | `QWEN3_TTS_MAX_REF_AUDIO_BYTES` | `10485760` | Maximum reference-audio upload size for `POST /v1/voices`. |
 | `QWEN3_TTS_VOICES_DIR` | `/data/voices` | Where user-registered clones persist. **Mount a volume here.** |

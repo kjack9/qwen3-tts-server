@@ -44,4 +44,4 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["server.py"]
+packages = ["server.py", "voice_registry.py", "inference_pool.py", "speech_chunking.py"]

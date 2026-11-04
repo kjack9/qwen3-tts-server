@@ -66,6 +66,7 @@ VOLUME ["/data/voices"]
 
 COPY server.py /app/server.py
 COPY voice_registry.py /app/voice_registry.py
+COPY inference_pool.py speech_chunking.py /app/
 COPY assets/ /app/assets/
 
 EXPOSE 8001

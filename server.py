@@ -45,12 +45,14 @@ import asyncio
 import io
 import json
 import logging
+import math
 import os
 import re
 import struct
 import subprocess
 import time
-from contextlib import asynccontextmanager
+import threading
+from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 
@@ -62,6 +64,8 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from voice_registry import KIND_CUSTOM, KIND_PRESET, VoiceRegistry
+from inference_pool import InferencePool, fork_fast_model, serialize_codec_decode, validate_fast_slots
+from speech_chunking import duration_chunks
 
 
 # -----------------------------------------------------------------------
@@ -109,8 +113,22 @@ def _optional_cuda_memory_fraction_env(name: str) -> float | None:
 
 
 ENABLE_CHUNKED_SPEECH = _bool_env("QWEN3_TTS_ENABLE_CHUNKED_SPEECH", True)
+INFERENCE_SLOTS = _positive_int_env("QWEN3_TTS_INFERENCE_SLOTS", 2)
+SERIALIZE_CODEC_DECODE = _bool_env("QWEN3_TTS_SERIALIZE_CODEC_DECODE", True)
+CHUNK_STRATEGY = os.getenv("QWEN3_TTS_CHUNK_STRATEGY", "duration").strip().lower()
+if CHUNK_STRATEGY not in {"duration", "characters"}:
+    raise RuntimeError("QWEN3_TTS_CHUNK_STRATEGY must be duration or characters")
+TARGET_SPEECH_CHUNK_SECONDS = _positive_int_env("QWEN3_TTS_TARGET_CHUNK_SECONDS", 30)
 MAX_SPEECH_CHUNK_SECONDS = _positive_int_env("QWEN3_TTS_MAX_CHUNK_SECONDS", 60)
 MAX_SPEECH_CHUNK_CHARS = _positive_int_env("QWEN3_TTS_MAX_CHUNK_CHARS", 500)
+try:
+    ESTIMATED_WORDS_PER_SECOND = float(os.getenv("QWEN3_TTS_ESTIMATED_WORDS_PER_SECOND", "3.13"))
+except ValueError as exc:
+    raise RuntimeError("QWEN3_TTS_ESTIMATED_WORDS_PER_SECOND must be positive") from exc
+if not math.isfinite(ESTIMATED_WORDS_PER_SECOND) or ESTIMATED_WORDS_PER_SECOND <= 0:
+    raise RuntimeError("QWEN3_TTS_ESTIMATED_WORDS_PER_SECOND must be positive and finite")
+if CHUNK_STRATEGY == "duration" and TARGET_SPEECH_CHUNK_SECONDS > MAX_SPEECH_CHUNK_SECONDS:
+    raise RuntimeError("QWEN3_TTS_TARGET_CHUNK_SECONDS must not exceed QWEN3_TTS_MAX_CHUNK_SECONDS")
 CUDA_MEMORY_FRACTION = _optional_cuda_memory_fraction_env(
     "QWEN3_TTS_CUDA_MEMORY_FRACTION"
 )
@@ -312,6 +330,7 @@ def _select_backend(prefer_faster: bool) -> tuple:
 # -----------------------------------------------------------------------
 
 _model = None
+_inference_pool = None
 _model_ready = False
 _FASTER_TTS = False
 _DEVICE = "cuda"
@@ -361,7 +380,7 @@ def _select_warmup_record():
 
 def _load_model_sync(device: str, prefer_faster: bool) -> None:
     """Synchronous model loader — runs in a background thread via asyncio.to_thread."""
-    global _model, _model_ready, _FASTER_TTS
+    global _model, _model_ready, _FASTER_TTS, _inference_pool
 
     if device == "cuda" and CUDA_MEMORY_FRACTION is not None:
         torch.cuda.set_per_process_memory_fraction(CUDA_MEMORY_FRACTION)
@@ -371,6 +390,8 @@ def _load_model_sync(device: str, prefer_faster: bool) -> None:
         )
 
     TTSModelClass, _FASTER_TTS, attn_impl = _select_backend(prefer_faster)
+    if INFERENCE_SLOTS > 1 and not _FASTER_TTS:
+        raise RuntimeError("Multiple inference slots require faster-qwen3-tts; set QWEN3_TTS_INFERENCE_SLOTS=1 for the reference/CPU backend")
     if _FASTER_TTS:
         backend_desc = "faster-qwen3-tts (CUDA graphs, tier 1)"
     elif attn_impl == "flash_attention_2":
@@ -422,6 +443,22 @@ def _load_model_sync(device: str, prefer_faster: bool) -> None:
         except Exception as exc:  # noqa: BLE001
             logger.warning("CUDA graph warmup failed (non-fatal): %s", exc)
 
+    if _FASTER_TTS and INFERENCE_SLOTS > 1 and SERIALIZE_CODEC_DECODE:
+        serialize_codec_decode(model_obj)
+    workers = [model_obj]
+    for index in range(1, INFERENCE_SLOTS):
+        logger.info("Preparing inference slot %d/%d with shared weights and private graphs/caches", index + 1, INFERENCE_SLOTS)
+        worker = fork_fast_model(model_obj)
+        if warmup_record is None:
+            raise RuntimeError("A registered voice is required to capture additional inference slots")
+        worker.generate_voice_clone(**warmup_kwargs)
+        if hasattr(worker, "generate_voice_clone_streaming"):
+            for _ in worker.generate_voice_clone_streaming(**warmup_kwargs, chunk_size=4):
+                pass
+        workers.append(worker)
+    if _FASTER_TTS:
+        validate_fast_slots(workers)
+    _inference_pool = InferencePool(workers)
     _model = model_obj
     _model_ready = True
     logger.info(
@@ -486,8 +523,8 @@ def _route_template(request: Request) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _INFER_SEM
-    # One inference at a time: CUDA-graph captures are not re-entrant.
-    _INFER_SEM = asyncio.Semaphore(1)
+    # Each admitted request leases generation state from a separate slot.
+    _INFER_SEM = asyncio.Semaphore(INFERENCE_SLOTS)
     if _METRICS_AVAILABLE:
         _M_MODEL_READY.set(0)
     # Load model off the event loop so uvicorn stays responsive.
@@ -498,7 +535,8 @@ async def lifespan(app: FastAPI):
         _M_MODEL_READY.set(1 if _model_ready else 0)
     yield
     # Cleanup on shutdown (releases GPU memory for clean container stop).
-    global _model
+    global _model, _inference_pool
+    _inference_pool = None
     _model = None
     if _METRICS_AVAILABLE:
         _M_MODEL_READY.set(0)
@@ -704,7 +742,9 @@ def _generate_audio_sync(
     if max_new_tokens is not None:
         kwargs["max_new_tokens"] = max_new_tokens
 
-    wavs, sr = _model.generate_voice_clone(**kwargs)
+    lease = _inference_pool.lease() if _inference_pool is not None else nullcontext(_model)
+    with lease as worker:
+        wavs, sr = worker.generate_voice_clone(**kwargs)
     wav = wavs[0]
     if max_audio_seconds is not None:
         max_samples = int(sr * max_audio_seconds)
@@ -718,6 +758,10 @@ def _wav_to_bytes_sync(wav: np.ndarray, sr: int, fmt: str) -> bytes:
     # faster-qwen3-tts returns float32 audio; wave.open expects int16 PCM.
     if wav.dtype == np.float32 or wav.dtype == np.float64:
         wav = np.clip(wav * 32767, -32768, 32767).astype(np.int16)
+    if fmt == "pcm":
+        if sr != 24000:
+            raise RuntimeError(f"OpenAI PCM output requires 24000 Hz; got {sr}")
+        return wav.astype('<i2', copy=False).tobytes()
     buf = io.BytesIO()
     sf.write(buf, wav, sr, format="WAV")
     wav_bytes = buf.getvalue()
@@ -751,6 +795,9 @@ def _split_sentences(text: str) -> list[str]:
 
 def _split_speech_chunks(text: str) -> list[str]:
     """Pack sentences into bounded chunks, splitting oversized sentences by word."""
+    if CHUNK_STRATEGY == "duration":
+        return duration_chunks(text, TARGET_SPEECH_CHUNK_SECONDS,
+                               MAX_SPEECH_CHUNK_SECONDS, ESTIMATED_WORDS_PER_SECOND)
     chunks = []
     pending = ""
     for sentence in _split_sentences(text):
@@ -775,6 +822,15 @@ def _split_speech_chunks(text: str) -> list[str]:
     if pending:
         chunks.append(pending)
     return chunks
+
+
+def _chunk_generation_limits():
+    # Duration mode splits the source text. Clipping a waveform or stopping at
+    # a codec-token cap can discard unsaid words, so keep that legacy behavior
+    # restricted to the explicit character strategy.
+    if ENABLE_CHUNKED_SPEECH and CHUNK_STRATEGY == "characters":
+        return MAX_SPEECH_CHUNK_TOKENS, MAX_SPEECH_CHUNK_SECONDS
+    return None, None
 
 
 def _validate_text(text: str | None, *, required: bool = True) -> str:
@@ -823,8 +879,8 @@ async def speech(
     voice_in = _resolve_voice(p["voice"])
     fmt = p["response_format"].lower()
 
-    if fmt not in ("mp3", "wav", "opus"):
-        raise HTTPException(400, f"response_format must be mp3, wav, or opus; got '{fmt}'")
+    if fmt not in ("mp3", "wav", "opus", "pcm"):
+        raise HTTPException(400, f"response_format must be mp3, wav, opus, or pcm; got '{fmt}'")
 
     if p["speed"] != 1.0:
         logger.warning(
@@ -846,8 +902,27 @@ async def speech(
     if not chunks:
         raise HTTPException(400, "No sentences found in text")
 
-    max_new_tokens = MAX_SPEECH_CHUNK_TOKENS if ENABLE_CHUNKED_SPEECH else None
-    max_audio_seconds = MAX_SPEECH_CHUNK_SECONDS if ENABLE_CHUNKED_SPEECH else None
+    max_new_tokens, max_audio_seconds = _chunk_generation_limits()
+    if fmt == "pcm":
+        async def generate_raw_pcm():
+            async with _INFER_SEM:
+                for chunk in chunks:
+                    if await request.is_disconnected():
+                        return
+                    wav, sr = await asyncio.to_thread(
+                        _generate_audio_sync, chunk, voice_in, p['instruct'],
+                        p['language'], max_new_tokens, max_audio_seconds,
+                    )
+                    yield await asyncio.to_thread(_wav_to_bytes_sync, wav, sr, 'pcm')
+
+        return StreamingResponse(
+            generate_raw_pcm(), media_type='audio/pcm',
+            headers={
+                'X-TTS-Stream': 'pcm', 'X-TTS-Sample-Rate': '24000',
+                'X-TTS-Channels': '1', 'X-TTS-Sample-Width': '2',
+                'X-TTS-Chunks': str(len(chunks)),
+            },
+        )
     async with _INFER_SEM:
         t0 = time.time()
         audio_chunks = []
@@ -916,6 +991,8 @@ async def speech_stream(
     text_in = _validate_text(p["text"])
     voice_in = _resolve_voice(p["voice"])
     fmt = p["response_format"].lower()
+    if fmt not in ('mp3', 'wav', 'opus', 'pcm'):
+        raise HTTPException(400, 'response_format must be mp3, wav, opus, or pcm')
     sentences = _split_sentences(text_in)
     chunks = (
         _split_speech_chunks(text_in)
@@ -932,6 +1009,7 @@ async def speech_stream(
 
     async def generate_chunks() -> AsyncGenerator[bytes, None]:
         async with _INFER_SEM:
+            max_new_tokens, max_audio_seconds = _chunk_generation_limits()
             for i, chunk_text in enumerate(chunks):
                 if await request.is_disconnected():
                     logger.info("TTS stream: client disconnected at chunk %d/%d", i, len(chunks))
@@ -943,8 +1021,8 @@ async def speech_stream(
                     voice_in,
                     p["instruct"],
                     p["language"],
-                    MAX_SPEECH_CHUNK_TOKENS if ENABLE_CHUNKED_SPEECH else None,
-                    MAX_SPEECH_CHUNK_SECONDS if ENABLE_CHUNKED_SPEECH else None,
+                    max_new_tokens,
+                    max_audio_seconds,
                 )
                 chunk = await asyncio.to_thread(_wav_to_bytes_sync, wav, sr, fmt)
                 logger.info(
@@ -1006,11 +1084,13 @@ async def speech_pcm_stream(
     voice_in = _resolve_voice(p["voice"])
 
     logger.info("TTS PCM stream: voice=%s chunk_size=%d len=%d", voice_in, chunk_size, len(text_in))
+    text_chunks = _split_speech_chunks(text_in) if ENABLE_CHUNKED_SPEECH else [text_in]
 
     async def generate_pcm() -> AsyncGenerator[bytes, None]:
         async with _INFER_SEM:
             loop = asyncio.get_running_loop()
             queue: asyncio.Queue = asyncio.Queue()
+            cancelled = threading.Event()
 
             record = _voice_registry.get(voice_in)
             if record is None:
@@ -1019,15 +1099,23 @@ async def speech_pcm_stream(
             def _stream_in_thread() -> None:
                 """Run the synchronous CUDA-graph generator in a thread, post chunks to queue."""
                 try:
-                    kwargs = _voice_clone_kwargs(
-                        record,
-                        text=text_in,
-                        language=p["language"],
-                        instruct=p.get("instruct"),
-                    )
-                    kwargs["chunk_size"] = chunk_size
-                    for item in _model.generate_voice_clone_streaming(**kwargs):
-                        loop.call_soon_threadsafe(queue.put_nowait, item)
+                    lease = _inference_pool.lease() if _inference_pool is not None else nullcontext(_model)
+                    with lease as worker:
+                        for text_chunk in text_chunks:
+                            if cancelled.is_set():
+                                break
+                            kwargs = _voice_clone_kwargs(
+                                record, text=text_chunk, language=p["language"],
+                                instruct=p.get("instruct"),
+                            )
+                            kwargs["chunk_size"] = chunk_size
+                            max_new_tokens, _ = _chunk_generation_limits()
+                            if max_new_tokens is not None:
+                                kwargs["max_new_tokens"] = max_new_tokens
+                            for item in worker.generate_voice_clone_streaming(**kwargs):
+                                if cancelled.is_set():
+                                    break
+                                loop.call_soon_threadsafe(queue.put_nowait, item)
                 except Exception as exc:  # noqa: BLE001
                     loop.call_soon_threadsafe(queue.put_nowait, exc)
                 finally:
@@ -1058,6 +1146,7 @@ async def speech_pcm_stream(
                         )
                     yield struct.pack(">I", len(pcm_bytes)) + pcm_bytes
             finally:
+                cancelled.set()
                 if not thread_task.done():
                     thread_task.cancel()
 
@@ -1072,6 +1161,7 @@ async def speech_pcm_stream(
             "X-TTS-Sample-Rate": "24000",
             "X-TTS-Channels": "1",
             "X-TTS-Sample-Width": "2",
+            "X-TTS-Text-Chunks": str(len(text_chunks)),
         },
     )
 
@@ -1089,6 +1179,17 @@ async def health():
         "model_id": MODEL_ID,
         "backend": backend,
         "device": _DEVICE,
+        "inference_slots": INFERENCE_SLOTS,
+        "serialized_codec_decode": SERIALIZE_CODEC_DECODE,
+        "available_inference_slots": _inference_pool.available if _inference_pool is not None else 0,
+        "chunking": {
+            "enabled": ENABLE_CHUNKED_SPEECH,
+            "strategy": CHUNK_STRATEGY,
+            "target_seconds": TARGET_SPEECH_CHUNK_SECONDS,
+            "max_seconds": MAX_SPEECH_CHUNK_SECONDS,
+            "estimated_words_per_second": ESTIMATED_WORDS_PER_SECOND,
+            "max_characters": MAX_SPEECH_CHUNK_CHARS,
+        },
         "voices": {
             "preset": len(_voice_registry.list(kind=KIND_PRESET)),
             "custom": len(_voice_registry.list(kind=KIND_CUSTOM)),

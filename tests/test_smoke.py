@@ -97,8 +97,9 @@ def test_split_sentences_no_terminator():
     assert server._split_sentences("hello world") == ["hello world"]
 
 
-def test_split_speech_chunks_bounds_long_sentences():
+def test_split_speech_chunks_bounds_long_sentences(monkeypatch):
     server = _import_server()
+    monkeypatch.setattr(server, "CHUNK_STRATEGY", "characters")
     chunks = server._split_speech_chunks(
         "First sentence. " + ("longword " * 120) + ". Final sentence!"
     )
@@ -165,6 +166,7 @@ def test_optional_cuda_memory_fraction_validation(monkeypatch):
 
 def test_speech_chunk_size_is_configurable(monkeypatch):
     server = _import_server()
+    monkeypatch.setattr(server, "CHUNK_STRATEGY", "characters")
     monkeypatch.setattr(server, "MAX_SPEECH_CHUNK_CHARS", 250)
     chunks = server._split_speech_chunks("word " * 200)
 
@@ -336,6 +338,7 @@ def test_standard_speech_synthesizes_all_bounded_chunks(monkeypatch):
     import numpy as np
 
     server = _import_server()
+    monkeypatch.setattr(server, "CHUNK_STRATEGY", "characters")
     calls = []
 
     def fake_generate(
@@ -404,6 +407,7 @@ def test_sentence_stream_caps_each_chunk(monkeypatch):
     import numpy as np
 
     server = _import_server()
+    monkeypatch.setattr(server, "CHUNK_STRATEGY", "characters")
     calls = []
 
     def fake_generate(
