@@ -95,11 +95,27 @@ def _bool_env(name: str, default: bool) -> bool:
     raise RuntimeError(f"{name} must be a boolean (true/false)")
 
 
+def _optional_cuda_memory_fraction_env(name: str) -> float | None:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return None
+    try:
+        fraction = float(value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a number greater than 0 and at most 1") from exc
+    if not 0 < fraction <= 1:
+        raise RuntimeError(f"{name} must be a number greater than 0 and at most 1")
+    return fraction
+
+
 ENABLE_CHUNKED_SPEECH = _bool_env("QWEN3_TTS_ENABLE_CHUNKED_SPEECH", True)
 MAX_SPEECH_CHUNK_SECONDS = _positive_int_env("QWEN3_TTS_MAX_CHUNK_SECONDS", 60)
+MAX_SPEECH_CHUNK_CHARS = _positive_int_env("QWEN3_TTS_MAX_CHUNK_CHARS", 500)
+CUDA_MEMORY_FRACTION = _optional_cuda_memory_fraction_env(
+    "QWEN3_TTS_CUDA_MEMORY_FRACTION"
+)
 CODEC_TOKENS_PER_SECOND = 12
 MAX_SPEECH_CHUNK_TOKENS = MAX_SPEECH_CHUNK_SECONDS * CODEC_TOKENS_PER_SECOND
-MAX_SPEECH_CHUNK_CHARS = 500
 WARMUP_TEXT = os.getenv(
     "QWEN3_TTS_WARMUP_TEXT",
     "The speech engine is warmed up and ready to respond.",
@@ -346,6 +362,13 @@ def _select_warmup_record():
 def _load_model_sync(device: str, prefer_faster: bool) -> None:
     """Synchronous model loader — runs in a background thread via asyncio.to_thread."""
     global _model, _model_ready, _FASTER_TTS
+
+    if device == "cuda" and CUDA_MEMORY_FRACTION is not None:
+        torch.cuda.set_per_process_memory_fraction(CUDA_MEMORY_FRACTION)
+        logger.info(
+            "PyTorch CUDA allocator limited to %.0f%% of visible device memory",
+            CUDA_MEMORY_FRACTION * 100,
+        )
 
     TTSModelClass, _FASTER_TTS, attn_impl = _select_backend(prefer_faster)
     if _FASTER_TTS:
@@ -727,17 +750,30 @@ def _split_sentences(text: str) -> list[str]:
 
 
 def _split_speech_chunks(text: str) -> list[str]:
-    """Split sentences into bounded text chunks, preserving word boundaries."""
+    """Pack sentences into bounded chunks, splitting oversized sentences by word."""
     chunks = []
+    pending = ""
     for sentence in _split_sentences(text):
+        sentence_parts = []
         while len(sentence) > MAX_SPEECH_CHUNK_CHARS:
             split_at = sentence.rfind(" ", 0, MAX_SPEECH_CHUNK_CHARS + 1)
             if split_at <= 0:
                 split_at = MAX_SPEECH_CHUNK_CHARS
-            chunks.append(sentence[:split_at].strip())
+            sentence_parts.append(sentence[:split_at].strip())
             sentence = sentence[split_at:].strip()
         if sentence:
-            chunks.append(sentence)
+            sentence_parts.append(sentence)
+
+        for part in sentence_parts:
+            candidate = f"{pending} {part}".strip() if pending else part
+            if pending and len(candidate) > MAX_SPEECH_CHUNK_CHARS:
+                chunks.append(pending)
+                pending = part
+            else:
+                pending = candidate
+
+    if pending:
+        chunks.append(pending)
     return chunks
 
 

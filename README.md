@@ -279,11 +279,12 @@ identical — leaving ~19 GB free for co-located workloads.
 
 Accepts **JSON body** or **query parameters**.
 
-By default, input is split into sentences, with sentences longer than 500
-characters further split at word boundaries. Chunks are synthesized
-sequentially and combined into one response. Each generated chunk is limited
-to `QWEN3_TTS_MAX_CHUNK_SECONDS` (default: 60 seconds); the total response may
-be longer.
+By default, adjacent sentences are packed together up to
+`QWEN3_TTS_MAX_CHUNK_CHARS` (default: 500 characters). Sentences longer than
+the limit are split at word boundaries. Chunks are synthesized sequentially
+and combined into one response. Each generated chunk is limited to
+`QWEN3_TTS_MAX_CHUNK_SECONDS` (default: 60 seconds); the total response may be
+longer.
 
 Set `QWEN3_TTS_ENABLE_CHUNKED_SPEECH=false` to restore the original behavior:
 one unchunked generation for this endpoint and uncapped, punctuation-based
@@ -302,9 +303,9 @@ sentence chunks for `/v1/audio/speech/stream`.
 ### `POST /v1/audio/speech/stream` — sentence-chunked
 
 Same parameters as above (JSON body or query params). Streams one self-contained audio file
-per sentence-sized chunk with length-prefixed framing. With chunking enabled
-(the default), sentences longer than 500 characters are split at word
-boundaries, and each generated chunk is limited to
+per bounded chunk with length-prefixed framing. With chunking enabled (the default),
+adjacent sentences are packed together up to `QWEN3_TTS_MAX_CHUNK_CHARS`; oversized
+sentences are split at word boundaries. Each generated chunk is limited to
 `QWEN3_TTS_MAX_CHUNK_SECONDS`. The total stream may be longer than that limit.
 When chunking is disabled, the route retains its original punctuation-based
 splitting and has no per-sentence duration cap.
@@ -455,6 +456,8 @@ client = OpenAI(api_key="sk-mysecret", base_url="http://localhost:8001/v1")
 | `QWEN3_TTS_MAX_TEXT_LENGTH` | `10000` | Maximum input characters (returns HTTP 413 if exceeded). |
 | `QWEN3_TTS_ENABLE_CHUNKED_SPEECH` | `true` | Enable bounded sequential chunks on standard and sentence-streaming routes; `false` restores the original generation behavior. |
 | `QWEN3_TTS_MAX_CHUNK_SECONDS` | `60` | Maximum generated duration per chunk when chunking is enabled. Codec-token limit is derived at 12 tokens per second. |
+| `QWEN3_TTS_MAX_CHUNK_CHARS` | `500` | Maximum input characters per generated chunk; long sentences split at a word boundary. |
+| `QWEN3_TTS_CUDA_MEMORY_FRACTION` | *(unset)* | Optional PyTorch CUDA caching-allocator limit as a fraction of total visible device memory (0–1]; allocations over the limit raise CUDA OOM rather than falling back to RAM. |
 | `QWEN3_TTS_MAX_REF_AUDIO_BYTES` | `10485760` | Maximum reference-audio upload size for `POST /v1/voices`. |
 | `QWEN3_TTS_VOICES_DIR` | `/data/voices` | Where user-registered clones persist. **Mount a volume here.** |
 | `QWEN3_TTS_PRESET_BUNDLE` | `assets/preset/bundle.safetensors` | Override preset bundle location. |

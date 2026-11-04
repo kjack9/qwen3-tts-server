@@ -106,32 +106,70 @@ def test_split_speech_chunks_bounds_long_sentences():
     assert len(chunks) > 3
     assert all(0 < len(chunk) <= server.MAX_SPEECH_CHUNK_CHARS for chunk in chunks)
     assert chunks[0] == "First sentence."
-    assert chunks[-1] == "Final sentence!"
+    assert chunks[-1].endswith("Final sentence!")
+
+
+def test_split_speech_chunks_pack_adjacent_sentences():
+    server = _import_server()
+    chunks = server._split_speech_chunks("First sentence. Second sentence. Third sentence.")
+
+    assert chunks == ["First sentence. Second sentence. Third sentence."]
 
 
 def test_chunk_settings_default_and_validation(monkeypatch):
     server = _import_server()
     enable_name = "QWEN3_TTS_ENABLE_CHUNKED_SPEECH"
     seconds_name = "QWEN3_TTS_MAX_CHUNK_SECONDS"
+    chars_name = "QWEN3_TTS_MAX_CHUNK_CHARS"
     monkeypatch.delenv(enable_name, raising=False)
     monkeypatch.delenv(seconds_name, raising=False)
+    monkeypatch.delenv(chars_name, raising=False)
 
     assert server._bool_env(enable_name, True) is True
     assert server._positive_int_env(seconds_name, 60) == 60
+    assert server._positive_int_env(chars_name, 500) == 500
 
     monkeypatch.setenv(enable_name, "off")
     monkeypatch.setenv(seconds_name, "23")
+    monkeypatch.setenv(chars_name, "250")
     assert server._bool_env(enable_name, True) is False
     assert server._positive_int_env(seconds_name, 60) == 23
+    assert server._positive_int_env(chars_name, 500) == 250
 
     for invalid in ("", "maybe"):
         monkeypatch.setenv(enable_name, invalid)
         with pytest.raises(RuntimeError, match=enable_name):
             server._bool_env(enable_name, True)
-    for invalid in ("0", "-2", "1.5", "invalid"):
-        monkeypatch.setenv(seconds_name, invalid)
-        with pytest.raises(RuntimeError, match=seconds_name):
-            server._positive_int_env(seconds_name, 60)
+    for name in (seconds_name, chars_name):
+        for invalid in ("0", "-2", "1.5", "invalid"):
+            monkeypatch.setenv(name, invalid)
+            with pytest.raises(RuntimeError, match=name):
+                server._positive_int_env(name, 60)
+
+
+def test_optional_cuda_memory_fraction_validation(monkeypatch):
+    server = _import_server()
+    name = "QWEN3_TTS_CUDA_MEMORY_FRACTION"
+    monkeypatch.delenv(name, raising=False)
+    assert server._optional_cuda_memory_fraction_env(name) is None
+
+    for value in ("0.25", "1"):
+        monkeypatch.setenv(name, value)
+        assert server._optional_cuda_memory_fraction_env(name) == float(value)
+
+    for value in ("0", "-0.1", "1.01", "invalid"):
+        monkeypatch.setenv(name, value)
+        with pytest.raises(RuntimeError, match=name):
+            server._optional_cuda_memory_fraction_env(name)
+
+
+def test_speech_chunk_size_is_configurable(monkeypatch):
+    server = _import_server()
+    monkeypatch.setattr(server, "MAX_SPEECH_CHUNK_CHARS", 250)
+    chunks = server._split_speech_chunks("word " * 200)
+
+    assert len(chunks) > 1
+    assert all(len(chunk) <= 250 for chunk in chunks)
 
 
 def test_openai_voice_alias_overrides_are_case_insensitive():
